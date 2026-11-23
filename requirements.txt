@@ -1,0 +1,8 @@
+streamlit>=1.36
+plotly>=5.20
+pandas>=2.0
+numpy
+scipy
+openpyxl
+biom-format    # only for BIOM input
+h5py           # only for BIOM input
