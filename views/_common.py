@@ -11,11 +11,17 @@ import streamlit as st
 import skin_engine as E
 import skin_plots as P
 
-# Streamlit replaced use_container_width=True by width="stretch"; support both.
-STRETCH_PLOT = ({"width": "stretch"} if "width" in inspect.signature(st.plotly_chart).parameters
-                else {"use_container_width": True})
-STRETCH_DF = ({"width": "stretch"} if "width" in inspect.signature(st.dataframe).parameters
-              else {"use_container_width": True})
+# Streamlit replaced use_container_width=True by width="stretch"; support both. Older versions also have a
+# `width` parameter, but it only takes pixels (an int): the new API is recognised by its text default.
+def _stretch(func) -> dict:
+    param = inspect.signature(func).parameters.get("width")
+    if param is not None and isinstance(param.default, str):
+        return {"width": "stretch"}
+    return {"use_container_width": True}
+
+
+STRETCH_PLOT = _stretch(st.plotly_chart)
+STRETCH_DF = _stretch(st.dataframe)
 
 
 def plot(fig, key=None):
