@@ -41,16 +41,31 @@ CHDR1806_SKINERGY_PSORIASIS/
   divided by the root total, and the reads of the root not assigned at that rank become "Unclassified".
 - **Nothing is loaded until you click Load.** Loaded files stay loaded when you switch pages; changing
   a file on the drive (or the rank, modality or part) reloads after the next click / **Rescan**.
-- **Metadata from all metadata files.** Every file in every `metadata/` folder is combined into one table
-  (`combined_metadata.csv`, downloadable), row by row on `study + sample_id` (rows without a sample id:
-  study + subject + site + lesion status + timepoint). A file can add rows and fill blanks of another
-  file. Where files disagree on a value, **the file in the study's own CHDR folder wins** (if those
-  files agree among themselves); otherwise the value is left missing. Rows without a `study` column get
-  the study of their folder.
+- **Metadata of the loaded files.** When you click Load, the metadata files that belong to the loaded data
+  files are combined into one table (`combined_metadata.csv`, downloadable; removed again when nothing is
+  loaded): every metadata file of their own study folders, plus a metadata file in another study folder
+  that holds sample ids of a loaded file (e.g. a shared sequencing run). Data setup > "Metadata files"
+  shows which files are used, per data file. Rows are combined on `study + sample_id` (`LCAB_ID` also
+  counts as sample id; rows without a sample id: study + subject + site + lesion status + timepoint). A
+  file can add rows and fill blanks of another file. Where files disagree on a value, **the file in the
+  study's own CHDR folder wins** (if those files agree among themselves); otherwise the value is left
+  missing. Rows without a `study` column get the study of their folder. A patient written differently in
+  two metadata files of a study (`200_AN` in the energy metadata, `200` in the clinical metadata) is linked
+  by number to the spelling of the file that has the group (listed as "patient id").
+- **Microbiome sample names**: the Biotaviz sample columns are matched to the metadata `sample_id`; if
+  they are not there, to the metadata column that holds them (e.g. a sequencing id column). Skin or gut
+  comes from the metadata `site` (`skin` / `gut`), else from words in it or in `sample source` (swab,
+  faeces ...), else from the part chosen in the list.
+- **Energy metabolism sites** come from the metadata column `sample source`, matched by `LCAB_ID`:
+  `blister perilesional` = lesional, `blister non-lesional` = non-lesional, `blister` = healthy volunteer,
+  `plasma` = plasma. One file with both blister and plasma rows is split by it. A `Site` column in the
+  data file itself is still used if it is there. A blister without a lesion score, skin type or body site
+  in its own metadata row takes them from the skin row of that site and visit.
 - **Discrepancies** are listed after loading (Data setup > "Metadata discrepancies", filterable,
   downloadable as CSV): values that differ between metadata files, group / stage that differ within a
-  patient, global severity that differs within one visit, microbiome samples whose study folder or
-  file name contradicts the metadata, and samples in two files (the first file is used).
+  patient, global severity that differs within one visit, patient ids linked across files, microbiome
+  samples whose study folder or file name contradicts the metadata, and samples in two files (the first
+  file is used).
 - Files that need extra packages: `.xls` needs `xlrd`, `.biom` needs `biom-format`. Emu per-sample TSV
   folders are not listed; use manual loading for those.
 
@@ -65,7 +80,7 @@ Default paths can be set in `views/data_setup.py` (`DEFAULTS`) or with the envir
 | Metadata (all modalities) | Drive: all files in the `metadata/` folders, combined (see above). Manual: ONE metadata file, `meta_data_all_complete.csv` (blank: the one in the sequencing folder) |
 | Skin and gut microbiome | Drive: Biotaviz Excel / text files or `.biom` files. Manual: filtered Emu tables plus `meta_data_all3_new.csv`; or BIOM files (see below) |
 | Ceramides | Long table (`study, subject, occ, location, ceramide, value`) or wide (one column per ceramide) |
-| Energy metabolism (1806) | Two files, blister fluid and plasma: `LCAB_ID, Subj_ID, Sampling_time, Succinate, Fumarate, Malate, Isocitrate`; the blister file also has `Site` (lesional / non-lesional) |
+| Energy metabolism (1806) | Blister fluid and plasma: `LCAB_ID, Subj_ID, Sampling_time, Succinate, Fumarate, Malate, Isocitrate`. Drive: the site from the metadata `sample source` (by `LCAB_ID`). Manual: the blister file has `Site` (lesional / non-lesional) |
 
 Text files may be tab-, semicolon- or comma-separated, with decimal commas or points; Excel also works.
 Column names are matched through the alias list in `datasets.py` (`COLUMN_ALIASES`).

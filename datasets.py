@@ -65,7 +65,8 @@ COLUMN_ALIASES = {
     "study": ["study", "study_id", "studynr", "protocol"],
     "subject": ["subject", "subj_id", "subject_id", "subjid", "patient", "patient_id", "participant", "subj"],
     "timepoint": ["timepoint", "sampling_time", "occ", "occasion", "visit", "time", "day", "week", "timepoint_code"],
-    "site": ["location", "lesion_status", "lesion", "site", "matrix", "compartment", "specimen", "site_code", "lesion_site"],
+    "site": ["location", "lesion_status", "lesion", "site", "matrix", "compartment", "specimen", "site_code", "lesion_site",
+             "sample_source"],
     "batch": ["batch", "plate", "run"],
     "value": ["value", "concentration", "conc", "amount", "result", "intensity", "area", "relative_abundance"],
     "_ignore": ["lcab_id", "sample_id", "sample", "sample_nr", "id", "nr"],
@@ -425,6 +426,15 @@ def load_metadata_reference(path, pasi_cutoffs=(10, 20)) -> MetadataReference:
     status = _text(get("lesion_status")).str.lower().str.replace(r"[ _]", "-", regex=True)
     status = status.replace({"rnos": "nostril", "nonlesional": "non-lesional", "non-lesion": "non-lesional"})
     status = status.replace(E.SITE_ALIASES)
+    if "sample_source" in m:          # e.g. energy metadata: 'blister perilesional' / 'blister non-lesional' / 'plasma'
+        # kept apart from the skin sites ('blister-lesional', 'blister-non-lesional', 'blister', 'plasma'): a blister
+        # is never a second skin lesion of the visit, and skin samples are never matched to a blister row
+        src = _text(m["sample_source"]).str.lower().str.replace(r"[ _]", "-", regex=True)
+        kind = pd.Series(np.where(src.str.contains("plasma|serum"), "plasma",
+                                  np.where(src.str.contains("blister"), "blister", "")), index=m.index)
+        sub = src.str.replace("blister", "", regex=False).str.strip("-").replace(E.SITE_ALIASES)
+        label = kind + np.where(kind.eq("blister") & sub.isin(["lesional", "non-lesional"]), "-" + sub, "")
+        status = status.where(status.ne("") | kind.eq(""), label)
     site = status.where(status.ne(""), compartment).mask(compartment.eq("gut"), "gut")
     site = site.mask(site.isin(E.HEALTHY_LABELS), "healthy")
     raw_tp = norm_timepoint(get("timepoint"))
@@ -588,10 +598,14 @@ def apply_sample_metadata(datasets: dict, ref: MetadataReference | None, tab: pd
         for i in md.index:
             study, patient, site = str(md.at[i, "study"]), str(md.at[i, "patient"]), str(md.at[i, "site"])
             row, how = None, None
-            if ids[i] and (study, ids[i]) in by_id.index:
-                row, how = by_id.loc[(study, ids[i])], "sample id"
-            else:
+
+            def key_match(exclude=""):
+                nonlocal ambiguous, no_lesion
+                row, how = None, None
                 cand = by_key.get((study, patient, site, tp[i]))
+                if cand is not None and exclude:
+                    cand = cand[cand["sample_id"].ne(exclude)]
+                    cand = cand if len(cand) else None
                 if cand is not None and len(cand) == 1 and site == "lesional" and own_rank[i] > 1:
                     no_lesion += 1                         # lesion 2 of the table; the metadata file has one lesion
                 elif cand is not None and len(cand) == 1:
@@ -609,6 +623,25 @@ def apply_sample_metadata(datasets: dict, ref: MetadataReference | None, tab: pd
                                      "skin_type": cand["skin_type"].iloc[0] if same["skin_type"] else np.nan,
                                      "body_site": cand["body_site"].iloc[0] if same["body_site"] else np.nan})
                     how = "patient + site + timepoint (several rows)"
+                return row, how
+
+            if ids[i] and (study, ids[i]) in by_id.index:
+                row, how = by_id.loc[(study, ids[i])], "sample id"
+                # e.g. a blister's own metadata row (sample source, visit) has no lesion score, skin type or body
+                # site: the skin row of that site and visit has them
+                blank = lambda v: v is None or v == "" or (not isinstance(v, str) and pd.isna(v))
+                fields = [c for c in ("local_severity", "skin_type", "body_site") if blank(row.get(c))
+                          and (c != "local_severity" or site == "lesional")]
+                if fields and str(row.get("site")) != site:                # the row is not a skin row itself
+                    extra, how2 = key_match(exclude=row["sample_id"])
+                    got = [c for c in fields if extra is not None and not blank(extra.get(c))]
+                    if got:
+                        row = row.copy()
+                        for c in got:
+                            row[c] = extra.get(c)
+                        how = f"sample id; {', '.join(c.replace('_', ' ') for c in got)}: {how2}"
+            else:
+                row, how = key_match()
             if row is not None:
                 out.loc[i, ["matched by", "metadata sample", "local_severity", "skin_type", "body_site"]] = [
                     how, row["sample_id"], row["local_severity"], row["skin_type"], row["body_site"]]

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import re
 import tempfile
 
 from pathlib import Path
@@ -16,7 +17,7 @@ import datasets as DS
 import discovery as D
 import load_studies as L
 from ceramide_loader import ceramide_dataset
-from energy_loader import energy_dataset
+from energy_loader import energy_dataset, split_by_metadata
 from views import _common as C
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -245,7 +246,7 @@ def render():
 
 
 # =============================================================== V2: automatic loading from the data drive
-COMBINED_METADATA_FILE = os.path.join(APP_DIR, "combined_metadata.csv")   # all metadata files, combined
+COMBINED_METADATA_FILE = os.path.join(APP_DIR, "combined_metadata.csv")   # metadata of the loaded files, combined
 
 
 def _mtime(path) -> float:
@@ -273,6 +274,32 @@ def _read_full(path, sheet, mtime):
 
 
 @st.cache_data(show_spinner=False)
+def _meta_values(path, mtime):
+    return D.cell_values(path)
+
+
+def _item_ids(item, rank) -> set:
+    """The sample ids of a data file (lower case): Biotaviz / BIOM sample names, else its sample id column."""
+    try:
+        if item["modality"] == "microbiome":
+            mat, _ = _read_microbiome(item["path"], item["sheet"], rank, _mtime(item["path"]))
+            return {str(i).strip().lower() for i in mat.index}
+        df = _read_full(item["path"], item["sheet"], _mtime(item["path"]))
+    except Exception:
+        return set()
+    norm = [re.sub(r"[\s\-]+", "_", str(c).strip().lower()) for c in df.columns]
+    col = next((df.columns[norm.index(c)] for c in DS.ID_COLUMNS if c in norm), None)
+    if col is None:
+        return set()
+    return {v for v in df[col].fillna("").astype(str).str.strip().str.lower() if v and v != "nan"}
+
+
+def match_metadata(chosen, studies, rank):
+    return D.match_metadata(chosen, studies, lambda it: _item_ids(it, rank),
+                            lambda p: _meta_values(p, _mtime(p)))
+
+
+@st.cache_data(show_spinner=False)
 def _combine(files):
     return D.combine_metadata([(p, study) for p, study, _ in files])
 
@@ -295,7 +322,7 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
     items: dicts from discovery.scan (modality / part as chosen); metadata_files: [(path, study)]."""
     datasets, status, notes = {}, {}, []
     disc = pd.DataFrame()
-    ref, meta_file = None, None
+    ref, meta_file, combined = None, None, None
     try:
         combined, disc, mnotes = _combine(tuple((str(p), s, _mtime(p)) for p, s in metadata_files))
         notes += mnotes
@@ -303,7 +330,9 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
         meta_file = COMBINED_METADATA_FILE
         ref = DS.load_metadata_reference(meta_file)
         notes += ref.notes
-        status["Metadata"] = f"{len(metadata_files)} file(s) combined: {len(combined)} samples, {len(ref.patients)} patients"
+        status["Metadata"] = (f"{len(metadata_files)} file(s) combined ("
+                              + ", ".join(os.path.basename(p) for p, _ in metadata_files)
+                              + f"): {len(combined)} samples, {len(ref.patients)} patients")
     except Exception as exc:
         status["Metadata"] = f"not loaded: {exc}"
     by_mod = {}
@@ -319,7 +348,7 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
                 notes += [f"[microbiome] {x}" for x in n]
                 comp = it["part"] if it["part"] in ("skin", "gut") else None      # checked against the metadata
                 tables.append((mat, {"file": it["file"], "study": it["study"], "compartment": comp}))
-            mat, md, n, flags = L.assemble_microbiome(tables, meta_file)
+            mat, md, n, flags, origin = L.assemble_microbiome(tables, meta_file)
             datasets.update(DS.microbiome_datasets(mat, md, n))
             if len(flags):
                 disc = pd.concat([disc, flags], ignore_index=True)
@@ -327,8 +356,8 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
                 if key not in datasets:
                     status[label] = f"no {key} samples in the loaded files"
                     continue
-                ids = {i.split("|", 1)[-1].lower() for i in datasets[key].mat.index}
-                used = [info["file"] for m, info in tables if ids & {str(i).lower() for i in m.index}]
+                ids = set(datasets[key].md["sample"].astype(str))
+                used = sorted({origin[i] for i in ids if i in origin})
                 status[label] = f"{len(ids)} samples from {len(used)} file(s): {', '.join(used)}"
         except Exception as exc:
             status["Skin microbiome"] = status["Gut microbiome"] = f"not loaded: {exc}"
@@ -342,11 +371,14 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
             status["Ceramides"] = f"not loaded: {exc}"
     if by_mod.get("energy"):
         try:
-            tables = {}
+            tables, enotes = {}, []
             for it in by_mod["energy"]:
-                tables.setdefault(it["part"], []).append(
-                    (_read_full(it["path"], it["sheet"], _mtime(it["path"])), it["study"], it["file"]))
-            datasets["energy"] = energy_dataset(tables)
+                raw = _read_full(it["path"], it["sheet"], _mtime(it["path"]))
+                split, n = split_by_metadata(raw, it["part"], it["study"], combined)   # site from 'sample source'
+                enotes += n
+                for part, df in split.items():
+                    tables.setdefault(part, []).append((df, it["study"], it["file"]))
+            datasets["energy"] = energy_dataset(tables, enotes)
             status["Energy metabolism"] = "loaded (" + ", ".join(f"{k}: {len(v)} file(s)" for k, v in tables.items()) + ")"
         except Exception as exc:
             status["Energy metabolism"] = f"not loaded: {exc}"
@@ -387,17 +419,29 @@ def _render_drive():
         return
     meta_files = [(str(p), stdy.study) for stdy in studies for p in stdy.metadata]
     items = [_item_settings(it) for stdy in studies for it in stdy.items]
+    loaded = set(st.session_state.get("drive_loaded", []))
+    chosen = [it for it in items if it["id"] in loaded and it["modality"] != "unknown"]
+    rank = st.session_state["cfg_rank"]
+    meta_used, meta_match, match_notes = match_metadata(chosen, studies, rank) if chosen else ([], pd.DataFrame(), [])
+    used_paths = {p for p, _ in meta_used}
     st.caption(f"{len(studies)} study folder(s): " + ", ".join(f"{s.path.name}" for s in studies)
-               + f". {len(meta_files)} metadata file(s) (all are combined), {len(items)} data file(s).")
+               + f". {len(meta_files)} metadata file(s), {len(items)} data file(s).")
     for stdy in studies:
         for n in stdy.notes:
             st.caption(f"⚠ {n}")
-    with st.expander(f"Metadata files ({len(meta_files)}): all are used and combined", expanded=False):
-        C.table(pd.DataFrame([{"study folder": Path(p).parent.parent.name if Path(p).parent.name.lower() == "metadata"
+    with st.expander(f"Metadata files: {len(used_paths)} of {len(meta_files)} used for the loaded files", expanded=False):
+        st.caption("Only the metadata of the loaded data files is combined: every metadata file of their own study "
+                   "folders, plus a metadata file of another study folder that holds sample ids of a loaded file.")
+        C.table(pd.DataFrame([{"used": "yes" if p in used_paths else "",
+                               "study folder": Path(p).parent.parent.name if Path(p).parent.name.lower() == "metadata"
                                else Path(p).parent.name, "file": os.path.basename(p), "path": p}
                               for p, _ in meta_files]))
+        if len(meta_match):
+            st.markdown("**Metadata per loaded data file**")
+            C.table(meta_match)
+        for n in match_notes:
+            st.caption(f"⚠ {n}")
 
-    loaded = set(st.session_state.get("drive_loaded", []))
     st.subheader("Data files")
     st.caption("The modality is recognised from the file's content; change it if it is wrong. Microbiome: skin or "
                "gut is taken from the metadata of every sample ('from metadata'); the file name is only checked "
@@ -428,18 +472,23 @@ def _render_drive():
         row[5].button("Unload" if on else "Load", key=f"btn_{u}", on_click=_toggle, args=([it["id"]], not on),
                       disabled=it["modality"] == "unknown" and not on, type="secondary" if on else "primary")
 
-    chosen = [it for it in items if it["id"] in loaded and it["modality"] != "unknown"]
     signature = (tuple(sorted((it["id"], it["modality"], it["part"], _mtime(it["path"])) for it in chosen)),
-                 tuple((p, _mtime(p)) for p, _ in meta_files), st.session_state["cfg_rank"])
+                 tuple((p, _mtime(p)) for p, _ in meta_used), rank)
     bundle = st.session_state.get("bundle")
     if not chosen:
         if bundle is not None and bundle.get("source") == "drive":
             del st.session_state["bundle"]
             _clear_results()
+        if os.path.exists(COMBINED_METADATA_FILE):          # only exists while drive files are loaded
+            try:
+                os.remove(COMBINED_METADATA_FILE)
+            except OSError:
+                pass
         return
     if bundle is None or bundle.get("source") != "drive" or bundle.get("signature") != signature:
         with st.spinner(f"Loading {len(chosen)} file(s) ..."):
-            bundle = load_bundle_drive(chosen, meta_files, st.session_state["cfg_rank"], _saved_map())
+            bundle = load_bundle_drive(chosen, meta_used, rank, _saved_map())
+        bundle["notes"] = match_notes + bundle["notes"]
         bundle["signature"] = signature
         st.session_state["bundle"] = bundle
         _clear_results()

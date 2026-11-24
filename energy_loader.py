@@ -34,10 +34,61 @@ def _has_site_column(raw: pd.DataFrame) -> bool:
     return any(re.sub(r"[\s\-]+", "_", str(c).strip().lower()) in DS.COLUMN_ALIASES["site"] for c in raw.columns)
 
 
-def energy_dataset(tables: dict) -> DS.Dataset:
+def _source_label(row: dict) -> str:
+    """The specimen / site label of a metadata row: its 'sample source' (e.g. 'blister perilesional',
+    'blister non-lesional', 'blister', 'plasma'), else its site when that names a blister or plasma."""
+    src = str(row.get("sample_source") or "").strip()
+    if not src:
+        site = str(row.get("site") or "").strip()
+        src = site if re.search(r"blister|plasma|serum", site, re.I) else ""
+    return src
+
+
+def split_by_metadata(raw: pd.DataFrame, specimen: str, study: str, meta: pd.DataFrame | None):
+    """Site (and blister / plasma) of every row of an energy file from its metadata row, matched by the file's
+    sample id (LCAB_ID / sample_id ...) = the metadata sample_id. The metadata column 'sample source' says
+    'blister perilesional' (lesional), 'blister non-lesional', 'blister' (healthy volunteer) or 'plasma'.
+    A Site column in the file itself is kept. Rows without a metadata match keep `specimen` (the part chosen
+    on Data setup). Returns ({specimen: DataFrame}, notes)."""
+    if meta is None or meta.empty:
+        return {specimen: raw}, []
+    norm = [re.sub(r"[\s\-]+", "_", str(c).strip().lower()) for c in raw.columns]
+    id_col = next((raw.columns[norm.index(c)] for c in DS.ID_COLUMNS if c in norm), None)
+    if id_col is None:
+        return {specimen: raw}, [f"[energy] {specimen} file without a sample id column (LCAB_ID / sample_id): "
+                                 f"the site cannot be taken from the metadata 'sample source'"]
+    rows = meta.assign(_sid=meta["sample_id"].fillna("").astype(str).str.strip().str.lower(),
+                       _study=meta["study"].fillna("").astype(str).str.strip())
+    rows = rows[rows["_sid"].ne("")]
+    own = {r["_sid"]: _source_label(r) for r in rows[rows["_study"] == str(study)].to_dict("records")}
+    other = {r["_sid"]: _source_label(r) for r in rows.to_dict("records")}
+    sid = raw[id_col].fillna("").astype(str).str.strip().str.lower()
+    src = sid.map(lambda v: own.get(v) or other.get(v) or "")
+    kind = src.str.lower().map(lambda v: "plasma" if ("plasma" in v or "serum" in v)
+                               else ("blister" if "blister" in v else ""))
+    kind = kind.where(kind.ne(""), specimen)
+    has_site = _has_site_column(raw)
+    out, notes = {}, []
+    for k, idx in kind.groupby(kind).groups.items():
+        part = raw.loc[idx].copy()
+        if k == "blister" and not has_site:
+            part["Site"] = src.loc[idx].where(src.loc[idx].ne(""), None).values
+        out[k] = part
+    found = int(src.ne("").sum())
+    notes.append(f"[energy] {specimen} file: {found} of {len(raw)} rows have a 'sample source' in the metadata "
+                 f"(by {id_col}); " + ", ".join(f"{k}: {len(v)} rows" for k, v in out.items())
+                 + ("; the file's own Site column is kept" if has_site else ""))
+    if found < len(raw):
+        notes.append(f"[energy] {len(raw) - found} row(s) without a metadata 'sample source' (e.g. "
+                     f"{raw.loc[src.eq(''), id_col].astype(str).tolist()[:4]}) are kept as {specimen}"
+                     + ("" if specimen != "blister" or has_site else " without a site label"))
+    return out, notes
+
+
+def energy_dataset(tables: dict, notes_in=()) -> DS.Dataset:
     """tables = {'blister': DataFrame, 'plasma': DataFrame}; a key is the specimen type of that file. A value can
     also be a list of (DataFrame, study of its folder, file name) to combine several files of one specimen."""
-    parts, notes = [], []
+    parts, notes = [], list(notes_in)
     flat = []
     for specimen, value in tables.items():
         for df, study, _ in (value if isinstance(value, list) else [(value, None, "")]):

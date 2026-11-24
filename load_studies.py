@@ -490,28 +490,79 @@ def read_biom_file(path, rank: str) -> tuple[pd.DataFrame, list[str]]:
     return mat.div(mat.sum(axis=1), axis=0), []
 
 
-def assemble_microbiome(tables: list, metadata_file) -> tuple[pd.DataFrame, pd.DataFrame, list[str], pd.DataFrame]:
+def assemble_microbiome(tables: list, metadata_file
+                        ) -> tuple[pd.DataFrame, pd.DataFrame, list[str], pd.DataFrame, dict]:
     """tables: [(samples x taxa relative abundance, {'file': name, 'study': study of its folder,
     'compartment': 'skin' | 'gut' | None from the file name})]. The samples are matched to the metadata file by
     sample_id; the study and site of a sample come from the metadata. Returns (matrix, metadata, notes,
-    discrepancies) like load_studies, plus a table of the samples whose file contradicts the metadata."""
+    discrepancies) like load_studies, plus a table of the samples whose file contradicts the metadata, and
+    {metadata sample_id: file it was read from}."""
     notes, flags = [], []
-    metadata_source = pd.read_csv(metadata_file, dtype=str)
+    metadata_source = pd.read_csv(metadata_file, dtype=str, keep_default_na=False)
     metadata_source.columns = [str(c).strip().lower() for c in metadata_source.columns]
-    meta_ids = metadata_source.assign(sample_id=metadata_source["sample_id"].fillna("").astype(str).str.strip())
-    comp = meta_ids["site"].fillna("").astype(str).str.strip().str.lower()
-    meta_ids = meta_ids[meta_ids["sample_id"].ne("") & comp.isin(COMPARTMENTS)]
+    for c in ("sample_id", "site", "study"):
+        if c not in metadata_source:
+            metadata_source[c] = ""
+    metadata_source = metadata_source.astype(str).apply(lambda col: col.str.strip())
+    # skin or gut of a metadata row: its site, else a word in its site / sample source ('skin swab', 'faeces' ...)
+    comp = metadata_source["site"].str.lower()
+    hint = (metadata_source["site"] + " " + metadata_source.get("sample_source", "")).str.lower()
+    other = hint.str.contains(r"blister|plasma|serum|blood")                # energy rows are never skin or gut
+    comp = comp.where(comp.isin(COMPARTMENTS) | other,
+                      np.where(hint.str.contains(r"faec|fec|stool|gut|\bfc\b"), "gut",
+                               np.where(hint.str.contains(r"skin|swab|nasal|nostril|lesion"), "skin", "")))
+    comp = comp.where(~other | comp.isin(COMPARTMENTS), "")
+    raw_site = metadata_source["site"].copy()
+    metadata_source["site"] = comp
+    tables = [(mat, info) for mat, info in tables if not mat.empty]
+    all_samples = {str(x).strip().lower() for mat, _ in tables for x in mat.index}
+
+    def lookup_on(col):
+        out = {}
+        for i, v in metadata_source[col].items():
+            if v and v.lower() in all_samples:
+                out.setdefault(v.lower(), []).append(i)
+        return out
+    by_col = {"sample_id": lookup_on("sample_id")}
+    missing = all_samples - set(by_col["sample_id"])
+    if missing:             # the sample names of a file may be in another metadata column (sequencing id ...)
+        best = max(((c, lookup_on(c)) for c in metadata_source.columns
+                    if c not in ("sample_id", "study", "subject", "site") and not c.startswith("_")),
+                   key=lambda cl: len(set(cl[1]) & missing), default=(None, {}))
+        if best[0] and set(best[1]) & missing:
+            by_col[best[0]] = best[1]
+            notes.append(f"{len(set(best[1]) & missing)} microbiome sample name(s) are not a metadata sample_id but are "
+                         f"in the metadata column '{best[0]}': matched on that column")
+            fill = [i for v, rows in best[1].items() if v in missing for i in rows
+                    if not metadata_source.at[i, "sample_id"]]
+            for i in fill:                                      # a row without sample_id gets the sample name
+                metadata_source.at[i, "sample_id"] = metadata_source.at[i, best[0]]
     lookup = {}
-    for sid, study, c in zip(meta_ids["sample_id"], meta_ids["study"].astype(str).str.strip(),
-                             meta_ids["site"].astype(str).str.strip().str.lower()):
-        lookup.setdefault(sid.lower(), []).append((sid, study, c))
+    for col, found in by_col.items():
+        for v, rows in found.items():
+            if col != "sample_id" and v in by_col["sample_id"]:
+                continue
+            for i in rows:
+                lookup.setdefault(v, []).append((i, metadata_source.at[i, "sample_id"],
+                                                 metadata_source.at[i, "study"], metadata_source.at[i, "site"]))
     parts, origin = [], {}
     for mat, info in tables:
-        if mat.empty:
-            continue
         rename, unknown = {}, []
         for sample in mat.index:
             hits = lookup.get(str(sample).strip().lower(), [])
+            if hits and info.get("compartment"):          # rows without skin / gut: the file's part decides
+                for i, _, _, c in hits:
+                    if not c:
+                        metadata_source.at[i, "site"] = info["compartment"]
+                hits = [(i, sid, st, c or info["compartment"]) for i, sid, st, c in hits]
+            no_site = [h for h in hits if h[3] not in COMPARTMENTS]
+            hits = [h[1:] for h in hits if h[3] in COMPARTMENTS]
+            if no_site and not hits:
+                flags.append({"kind": "microbiome sample", "study": no_site[0][2], "item": sample, "field": "site",
+                              "used": "", "values": f"metadata site '{raw_site.at[no_site[0][0]]}'",
+                              "files": info["file"], "rule": "neither skin nor gut in the metadata or the file name "
+                                                             "(set the part on Data setup): not used"})
+                continue
             if info.get("study"):
                 hits = [h for h in hits if h[1] == info["study"]] or hits
             if not hits:
@@ -541,13 +592,20 @@ def assemble_microbiome(tables: list, metadata_file) -> tuple[pd.DataFrame, pd.D
         if unknown:
             notes.append(f"{info['file']}: {len(unknown)} sample(s) are not a skin or gut sample_id of the metadata "
                          f"and were not used, e.g. {list(unknown[:6])}")
-        keep = mat.loc[list(rename)]
-        keep.index = [rename[s] for s in keep.index]
-        parts.append(keep)
+        if rename:
+            keep = mat.loc[list(rename)]
+            keep.index = [rename[s] for s in keep.index]
+            parts.append(keep)
     if not parts:
-        raise FileNotFoundError("none of the microbiome samples matched a skin or gut sample_id of the metadata")
+        some = sorted(all_samples)[:4]
+        ids = metadata_source.loc[metadata_source["sample_id"].ne(""), "sample_id"].tolist()[:4]
+        raise ValueError(f"none of the {len(all_samples)} microbiome sample names (e.g. {some}) is a sample id of "
+                         f"a skin or gut row in the metadata used (sample_ids there e.g. {ids}). Check that the "
+                         f"study's metadata folder has the metadata of these samples.")
     combined = pd.concat(parts, axis=0).fillna(0.0)
-    study_of = dict(zip(meta_ids["sample_id"], meta_ids["study"].astype(str).str.strip()))
+    meta_ids = metadata_source[metadata_source["sample_id"].ne("") & metadata_source["site"].isin(COMPARTMENTS)]
+    study_of = dict(zip(meta_ids["sample_id"], meta_ids["study"]))
+    metadata_source = metadata_source.apply(E.blank_to_nan)          # blanks -> missing, as read_csv gives
     studies = sorted({study_of[s] for s in combined.index})
     matrices, frames = [], []
     for study in studies:
@@ -565,7 +623,7 @@ def assemble_microbiome(tables: list, metadata_file) -> tuple[pd.DataFrame, pd.D
         frames.append(md)
     mat = pd.concat(matrices, axis=0).fillna(0.0)
     mat = mat.loc[:, (mat > 0).any(axis=0)]
-    return mat.div(mat.sum(axis=1), axis=0), pd.concat(frames, axis=0), notes, pd.DataFrame(flags)
+    return mat.div(mat.sum(axis=1), axis=0), pd.concat(frames, axis=0), notes, pd.DataFrame(flags), origin
 
 
 def standardize_study_metadata(

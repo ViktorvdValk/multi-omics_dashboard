@@ -51,7 +51,8 @@ METABOLITES = ("succinate", "fumarate", "malate", "isocitrate", "citrate")
 # canonical metadata columns (as in meta_data_all_complete.csv) and other spellings found in metadata files
 META_COLUMNS = ["sample_id", "study", "subject", "group", "site", "lesion_status", "region_location", "region",
                 "global_severity", "stage", "timepoint", "local_severity"]
-META_ALIASES = {"sample_id": ["sample_id", "sampleid", "sample", "sample_name", "sample_nr"],
+META_ALIASES = {"sample_id": ["sample_id", "sampleid", "sample", "sample_name", "sample_nr", "lcab_id"],
+                "sample_source": ["sample_source", "sample_type", "specimen", "specimen_type"],
                 "subject": ["subject", "subject_id", "subj_id", "subjid", "patient", "patient_id"],
                 "timepoint": ["timepoint", "time_point", "visit", "sampling_time"],
                 "lesion_status": ["lesion_status", "lesion", "location"],
@@ -231,6 +232,50 @@ def read_raw(path: str, sheet=None) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(text), sep=_sep(text.split("\n", 1)[0]), dtype=str, header=None)
 
 
+# =============================================================== which metadata files belong to the loaded data
+def cell_values(path: str) -> frozenset:
+    """Every non-empty cell of a metadata file, lower case (to find the files that hold a data file's sample ids)."""
+    try:
+        df = read_full(str(path))
+    except Exception:
+        return frozenset()
+    vals = {_clean(v).lower() for v in df.values.ravel()}
+    return frozenset(v for v in vals if v)
+
+
+def match_metadata(chosen: list, studies: list, ids_of, values_of) -> tuple[list, pd.DataFrame, list]:
+    """The metadata files to combine for the loaded data files `chosen`: every metadata file of their own study
+    folders, plus metadata files of OTHER study folders that hold sample ids of a loaded file (e.g. a shared
+    sequencing run). ids_of(item) -> set of the file's sample ids (lower case); values_of(path) -> cell values.
+    Returns ([(path, folder study)], table data file -> metadata files, notes)."""
+    folder_of = {s.study: s for s in studies}
+    all_meta = [(str(p), s.study) for s in studies for p in s.metadata]
+    used, rows, notes = {}, [], []
+    for it in chosen:
+        own = [(p, st) for p, st in all_meta if st == it["study"]]
+        ids = ids_of(it)
+        hits = {}
+        for p, st in all_meta:
+            n = len(ids & values_of(p)) if ids else 0
+            if n:
+                hits[p] = n
+        extra = [(p, st) for p, st in all_meta if st != it["study"] and hits.get(p)]
+        for p, st in own + extra:
+            used.setdefault(p, st)
+        if not own and not extra:
+            notes.append(f"[metadata] {it['file']}: no metadata file in {folder_of[it['study']].path.name}/metadata "
+                         f"and none elsewhere holds its sample ids")
+        elif ids and not any(hits.get(p) for p, _ in own + extra):
+            notes.append(f"[metadata] {it['file']}: none of its {len(ids)} sample ids (e.g. {sorted(ids)[:3]}) is in "
+                         f"a metadata file; it is matched on patient + site + timepoint only")
+        rows.append({"study": it["study"], "data file": it["file"],
+                     "metadata files": ", ".join(f"{Path(p).name}" + (f" ({hits[p]} ids)" if hits.get(p) else "")
+                                                 for p, _ in own + extra) or "none",
+                     "sample ids found": f"{sum(1 for i in ids if any(i in values_of(p) for p, _ in own + extra))}"
+                                         f" of {len(ids)}" if ids else "-"})
+    return list(used.items()), pd.DataFrame(rows), notes
+
+
 # =============================================================== combining the metadata files
 def _std_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -293,12 +338,13 @@ def combine_metadata(files: list) -> tuple[pd.DataFrame, pd.DataFrame, list]:
     data_cols = [c for c in allrows.columns if not c.startswith("_")]
     for c in data_cols:
         allrows[c] = allrows[c].map(_clean)
+    flags = _unify_subjects(allrows, notes)
     sid = allrows["sample_id"]
     alt = ("row:" + allrows["subject"] + "|" + allrows["site"].str.lower() + "|" + allrows["lesion_status"].str.lower()
            + "|" + allrows["timepoint"])
     allrows["_key"] = allrows["study"] + "|" + sid.where(sid.ne(""), alt)
 
-    flags, merged = [], []
+    merged = []
     for key, g in allrows.groupby("_key", sort=False):
         row = {}
         for c in data_cols:
@@ -339,6 +385,47 @@ def combine_metadata(files: list) -> tuple[pd.DataFrame, pd.DataFrame, list]:
                  + (f"; {n_multi} sample(s) are in more than one file" if n_multi else "")
                  + (f"; {len(disc)} discrepancies (see the list on Data setup)" if len(disc) else "; no discrepancies"))
     return combined, disc, notes
+
+
+def _unify_subjects(allrows: pd.DataFrame, notes: list) -> list:
+    """One spelling per patient across the metadata files of a study. The patients of the rows that have a group
+    (the clinical metadata) are the reference; a subject of another file that is none of them is linked by its
+    number when that fits exactly one reference patient (e.g. '200_AN' in the energy metadata = '200'), as the
+    data files are linked (datasets.match_subjects). Changes allrows['subject'] in place; returns flags."""
+    flags = []
+    for study, g in allrows.groupby("study"):
+        subj = g["subject"].map(lambda v: DS.norm_subject(v) if v else "")
+        ref = set(subj[g["group"].ne("") & subj.ne("")])
+        if not ref:
+            continue
+        keys = {r: DS._subject_keys(r, study) for r in ref}
+        lookup = {}
+        for rule in ("as written", "first number", "last number"):
+            for r, k in keys.items():
+                if rule in k:
+                    lookup.setdefault((rule, k[rule]), set()).add(r)
+        linked = {}
+        for other in sorted(set(subj[subj.ne("")]) - ref):
+            mine = DS._subject_keys(other, study)
+            for rule_mine, rule_ref in (("as written", "first number"), ("first number", "as written"),
+                                        ("first number", "first number"), ("last number", "last number")):
+                hit = lookup.get((rule_ref, mine.get(rule_mine)), set())
+                if len(hit) == 1:
+                    linked[other] = next(iter(hit))
+                    break
+        if not linked:
+            continue
+        change = subj.isin(list(linked))
+        for other, target in linked.items():
+            files = ", ".join(sorted(set(g.loc[subj.eq(other), "_file"])))
+            flags.append({"kind": "patient id", "study": study, "item": target, "field": "subject", "used": target,
+                          "values": f"{other} ({files}); {target}", "files": files,
+                          "rule": "the same patient number: the spelling of the clinical metadata is used"})
+        allrows.loc[change[change].index, "subject"] = subj[change].map(linked)
+        ex = next(iter(linked.items()))
+        notes.append(f"[metadata] study {study}: {len(linked)} patient id(s) of other metadata files linked to the "
+                     f"clinical metadata by number (e.g. '{ex[0]}' = '{ex[1]}')")
+    return flags
 
 
 def _patient_level_flags(m: pd.DataFrame) -> list:
