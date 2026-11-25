@@ -392,9 +392,14 @@ class MetadataReference:
 
 
 def read_metadata_file(path) -> pd.DataFrame:
-    """The metadata file as text, lower-case column names (csv like load_studies, or Excel)."""
-    p = str(path)
-    m = pd.read_excel(p, dtype=str) if p.lower().endswith((".xlsx", ".xls")) else pd.read_csv(p, dtype=str)
+    """The metadata file as text, lower-case column names (csv like load_studies, or Excel).
+    Accepts a path, or a DataFrame / pandas read directly (so the combined frame can be passed
+    in memory without a file on disk)."""
+    if isinstance(path, pd.DataFrame):
+        m = path.copy()
+    else:
+        p = str(path)
+        m = pd.read_excel(p, dtype=str) if p.lower().endswith((".xlsx", ".xls")) else pd.read_csv(p, dtype=str)
     m.columns = [str(c).strip().lower() for c in m.columns]
     return m
 

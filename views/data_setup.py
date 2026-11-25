@@ -359,13 +359,13 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
                     combined.loc[base] = row
                     base += 1
                 have |= {r["sample_id"].lower() for r in rec}
-        combined.drop(columns=["_files"], errors="ignore").to_csv(COMBINED_METADATA_FILE, index=False)
-        meta_file = COMBINED_METADATA_FILE
-        ref = DS.load_metadata_reference(meta_file)
+        # Pass the combined frame in memory to the downstream loaders — no file on disk is needed.
+        meta_df = combined.drop(columns=["_files"], errors="ignore").copy()
+        ref = DS.load_metadata_reference(meta_df)
         notes += ref.notes
         status["Metadata"] = (f"{len(metadata_files)} file(s) combined ("
                               + ", ".join(os.path.basename(p) for p, _ in metadata_files)
-                              + f"): {len(combined)} samples, {len(ref.patients)} patients")
+                              + f"): {len(meta_df)} samples, {len(ref.patients)} patients")
     except Exception as exc:
         status["Metadata"] = f"not loaded: {exc}"
     by_mod = {}
@@ -373,7 +373,7 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
         by_mod.setdefault(it["modality"], []).append(it)
     if by_mod.get("microbiome"):
         try:
-            if meta_file is None:
+            if meta_df is None:
                 raise FileNotFoundError("the microbiome needs the metadata (sample ids, sites, timepoints)")
             tables = []
             for it in by_mod["microbiome"]:
@@ -381,7 +381,7 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
                 notes += [f"[microbiome] {x}" for x in n]
                 comp = it["part"] if it["part"] in ("skin", "gut") else None      # checked against the metadata
                 tables.append((mat, {"file": it["file"], "study": it["study"], "compartment": comp}))
-            mat, md, n, flags, origin = L.assemble_microbiome(tables, meta_file)
+            mat, md, n, flags, origin = L.assemble_microbiome(tables, meta_df)
             datasets.update(DS.microbiome_datasets(mat, md, n))
             if len(flags):
                 disc = pd.concat([disc, flags], ignore_index=True)
@@ -423,7 +423,7 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
     for ds in datasets.values():
         notes += ds.notes
     return {"datasets": datasets, "status": status, "notes": notes, "tmap": tmap, "rank": rank,
-            "metadata_file": meta_file if ref is not None else None, "metadata_ref": ref,
+            "metadata_file": meta_df if ref is not None else None, "metadata_ref": ref,
             "discrepancies": disc, "source": "drive"}
 
 
@@ -602,10 +602,10 @@ def _bundle_sections(bundle):
                 C.table(show)
                 st.download_button("Download the list (CSV)", disc.to_csv(index=False), "metadata_discrepancies.csv",
                                    key="disc_dl")
-        if bundle.get("metadata_file") and os.path.isfile(bundle["metadata_file"]):
-            with open(bundle["metadata_file"], "rb") as fh:
-                st.download_button("Download the combined metadata (CSV)", fh.read(), "combined_metadata.csv",
-                                   key="meta_dl")
+        meta_df_dl = bundle.get("metadata_file")
+        if meta_df_dl is not None and isinstance(meta_df_dl, pd.DataFrame):
+            st.download_button("Download the combined metadata (CSV)", meta_df_dl.to_csv(index=False).encode(),
+                               "combined_metadata.csv", key="meta_dl")
     datasets = bundle["datasets"]
     if not datasets:
         return

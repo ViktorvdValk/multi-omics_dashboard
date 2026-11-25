@@ -547,7 +547,11 @@ def assemble_microbiome(tables: list, metadata_file
     discrepancies) like load_studies, plus a table of the samples whose file contradicts the metadata, and
     {metadata sample_id: file it was read from}."""
     notes, flags = [], []
-    metadata_source = pd.read_csv(metadata_file, dtype=str, keep_default_na=False)
+    if isinstance(metadata_file, pd.DataFrame):
+        metadata_source = metadata_file.copy().astype(str).apply(lambda col: col.str.strip())
+    else:
+        metadata_source = pd.read_csv(metadata_file, dtype=str, keep_default_na=False)
+        metadata_source = metadata_source.astype(str).apply(lambda col: col.str.strip())
     metadata_source.columns = [str(c).strip().lower() for c in metadata_source.columns]
     for c in ("sample_id", "site", "study"):
         if c not in metadata_source:

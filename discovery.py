@@ -859,14 +859,13 @@ def _apply_reference(combined: pd.DataFrame, file_paths: list) -> tuple[pd.DataF
 
 
 def _patient_level_flags(m: pd.DataFrame) -> list:
-    """Values that should be one per patient (group, stage) or per visit (global severity) but differ between
-    rows of the combined metadata."""
+    """Values that should be one per patient (group, stage) but differ between rows of the combined
+    metadata. global_severity is NOT flagged: it legitimately varies per visit and per lesion, so a
+    patient having different scores across visits is not a discrepancy."""
     out = []
     for field_, keys, rule in (
             ("group", ["study", "subject"], "one group per patient: skin rows first, 'healthy' wins"),
-            ("stage", ["study", "subject"], "one stage per patient: the first in the file is used"),
-            ("global_severity", ["study", "subject", "timepoint"],
-             "per visit: every sample keeps its own row's value; samples without one stay missing")):
+            ("stage", ["study", "subject"], "one stage per patient: the first in the file is used")):
         sub = m[m[field_].ne("") & m["subject"].ne("")]
         for k, g in sub.groupby(keys):
             distinct = []
