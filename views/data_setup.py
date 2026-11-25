@@ -246,7 +246,11 @@ def render():
 
 
 # =============================================================== V2: automatic loading from the data drive
-COMBINED_METADATA_FILE = os.path.join(APP_DIR, "combined_metadata.csv")   # metadata of the loaded files, combined
+# The combined metadata is a transient artifact — written to a temp dir so it never depends on
+# (or leaves behind) a file in the app / repo directory. Available at deployment without any
+# pre-existing file.
+import tempfile
+COMBINED_METADATA_FILE = os.path.join(tempfile.gettempdir(), "multiomics_combined_metadata.csv")
 
 
 def _mtime(path) -> float:
@@ -326,6 +330,35 @@ def load_bundle_drive(items: list, metadata_files: list, rank: str, saved_map=No
     try:
         combined, disc, mnotes = _combine(tuple((str(p), s, _mtime(p)) for p, s in metadata_files))
         notes += mnotes
+        # Recover the microbiome samples that are in the loaded data files but have no metadata row
+        # (e.g. 2230 skin swabs only in the reference). Append their reference rows so the metadata
+        # file and the loaded data agree, and only for studies actually being combined.
+        ref_path = D._find_reference()
+        if ref_path is not None:
+            have = set(combined["sample_id"].astype(str).str.strip().str.lower())
+            studies_in = {str(s) for s in combined["study"].dropna()}
+            for it in items:
+                if it.get("modality") != "microbiome":
+                    continue
+                try:
+                    mat, _ = _read_microbiome(it["path"], it["sheet"], rank, _mtime(it["path"]))
+                except Exception:
+                    continue
+                study = str(it.get("study") or "")
+                if study not in studies_in:
+                    continue
+                missing = {str(x).strip().lower() for x in mat.index} - have
+                if not missing:
+                    continue
+                rec, rnotes = L._recover_from_reference(missing, study, it.get("file", ""), ref_path)
+                notes += rnotes
+                if not rec:
+                    continue
+                base = len(combined)
+                for row in rec:
+                    combined.loc[base] = row
+                    base += 1
+                have |= {r["sample_id"].lower() for r in rec}
         combined.drop(columns=["_files"], errors="ignore").to_csv(COMBINED_METADATA_FILE, index=False)
         meta_file = COMBINED_METADATA_FILE
         ref = DS.load_metadata_reference(meta_file)

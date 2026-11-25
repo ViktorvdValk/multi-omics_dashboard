@@ -167,8 +167,11 @@ def standardize_metadata(df, study, column_map=None, pasi_cutoffs=(10, 20)):
     df["patient"] = df["patient"].astype(object).where(df["patient"].notna(), df["sample"]).astype(str)
     bad = df.groupby("patient")["severity"].nunique()
     if (bad > 1).any():
-        raise ValueError(f"[{study}] severity must be one value per patient (use the baseline severity "
-                         f"for every timepoint); inconsistent for {list(bad[bad > 1].index)[:5]}")
+        # A patient's stage may differ over time (or across lesions) and the per-sample value is the
+        # authority, so keep each sample's own severity; only list the patients whose stages differ.
+        n = int((bad > 1).sum())
+        notes.append(f"[{study}] {n} patient(s) have more than one severity across their samples (e.g. "
+                     f"{list(bad[bad > 1].index)[:5]}); each sample keeps its own stage")
     df["study"] = study
     df["patient"] = study + "|" + df["patient"]
     df["body_site"] = df["body_site"].astype(object).where(df["body_site"].notna(), "")

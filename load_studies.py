@@ -490,6 +490,55 @@ def read_biom_file(path, rank: str) -> tuple[pd.DataFrame, list[str]]:
     return mat.div(mat.sum(axis=1), axis=0), []
 
 
+def _recover_from_reference(missing: set, study: str, info_file: str, ref_path) -> tuple[list, list]:
+    """For microbiome samples that are in the data file but have no metadata row, recover their
+    group / site / lesion / stage / subject / timepoint from the clinical reference
+    (meta_data_all_complete.csv). Returns (list of metadata dicts, notes). Only samples actually
+    present in the data are recovered, and only when the reference has them."""
+    if ref_path is None:
+        return [], []
+    try:
+        ref = pd.read_csv(ref_path, dtype=str)
+    except Exception as exc:
+        return [], [f"[microbiome] reference {Path(ref_path).name} could not be read ({exc})"]
+    ref.columns = [re.sub(r"[\s\-]+", "_", str(c).strip().lower()) for c in ref.columns]
+    if "sample_id" not in ref or ref.empty:
+        return [], []
+    by_id = {}
+    for _, r in ref.iterrows():
+        sid = str(r.get("sample_id", "")).strip().lower()
+        if sid:
+            by_id.setdefault(sid, r)
+    rows, notes = [], []
+    for s in sorted(missing, key=lambda x: x.lower()):
+        r = by_id.get(s.lower())
+        if r is None:
+            continue
+        st = str(r.get("study", "")).strip()
+        if st and st != study:                     # only this study's own samples
+            continue
+        site = str(r.get("site", "")).strip().lower()
+        rows.append({
+            "sample_id": s.upper(), "study": study,
+            "subject": str(r.get("subject", "")).strip().replace(study + "_", ""),
+            "group": str(r.get("group", "")).strip(),
+            "site": site if site in ("skin", "gut", "blister", "plasma") else "skin",
+            "lesion_status": str(r.get("lesion_status", "")).strip(),
+            "timepoint": str(r.get("timepoint", "")).strip(),
+            "stage": str(r.get("stage", "")).strip(),
+            "global_severity": str(r.get("global_severity", "")).strip(),
+            "local_severity": str(r.get("local_severity", "")).strip(),
+            "region_location": str(r.get("region_location", "") or r.get("region", "")).strip(),
+            "batch": str(r.get("batch", "")).strip(),
+            "_file": str(info_file) + " (reference)", "_recovered": "reference",
+        })
+    if rows:
+        notes.append(f"{len(rows)} sample(s) missing from the metadata were recovered from the clinical "
+                     f"reference {Path(ref_path).name}: {', '.join(r['sample_id'] for r in rows[:6])}"
+                     + (" ..." if len(rows) > 6 else ""))
+    return rows, notes
+
+
 def assemble_microbiome(tables: list, metadata_file
                         ) -> tuple[pd.DataFrame, pd.DataFrame, list[str], pd.DataFrame, dict]:
     """tables: [(samples x taxa relative abundance, {'file': name, 'study': study of its folder,
@@ -504,14 +553,16 @@ def assemble_microbiome(tables: list, metadata_file
         if c not in metadata_source:
             metadata_source[c] = ""
     metadata_source = metadata_source.astype(str).apply(lambda col: col.str.strip())
-    # skin or gut of a metadata row: its site, else a word in its site / sample source ('skin swab', 'faeces' ...)
+    # skin or gut of a metadata row: its site, else a word in its site / sample source ('skin swab', 'faeces' ...).
+    # Energy rows (blister / plasma / serum) are kept apart: they are never skin or gut. Check gut and the
+    # energy words before skin, because 'blister perilesional' / 'blister non-lesional' contain 'lesion'.
     comp = metadata_source["site"].str.lower()
     hint = (metadata_source["site"] + " " + metadata_source.get("sample_source", "")).str.lower()
-    other = hint.str.contains(r"blister|plasma|serum|blood")                # energy rows are never skin or gut
-    comp = comp.where(comp.isin(COMPARTMENTS) | other,
-                      np.where(hint.str.contains(r"faec|fec|stool|gut|\bfc\b"), "gut",
-                               np.where(hint.str.contains(r"skin|swab|nasal|nostril|lesion"), "skin", "")))
-    comp = comp.where(~other | comp.isin(COMPARTMENTS), "")
+    other = hint.str.contains(r"blister|plasma|serum|blood")          # energy rows are never skin or gut
+    comp = np.where(other, "",
+                    np.where(comp.isin(COMPARTMENTS), comp,
+                             np.where(hint.str.contains(r"faec|fec|stool|gut|\bfc\b"), "gut",
+                                      np.where(hint.str.contains(r"skin|swab|nasal|nostril|lesion"), "skin", ""))))
     raw_site = metadata_source["site"].copy()
     metadata_source["site"] = comp
     tables = [(mat, info) for mat, info in tables if not mat.empty]
@@ -545,6 +596,8 @@ def assemble_microbiome(tables: list, metadata_file
             for i in rows:
                 lookup.setdefault(v, []).append((i, metadata_source.at[i, "sample_id"],
                                                  metadata_source.at[i, "study"], metadata_source.at[i, "site"]))
+    # (Recovery of data-file samples missing from the metadata is done in load_bundle_drive,
+    # before the combined metadata file is written, so the file and the loaded data agree.)
     parts, origin = [], {}
     for mat, info in tables:
         rename, unknown = {}, []
@@ -675,17 +728,10 @@ def standardize_study_metadata(
 
     stage = E.blank_to_nan(rows["stage"])          # blank cells -> missing, stays text
 
-    def one_patient_value(values: pd.Series) -> object:
-        present = values.dropna().astype(str).str.strip().str.lower().unique()
-        if len(present) > 1:
-            raise ValueError(
-                f"Inconsistent patient-level metadata for study {study}: "
-                f"{list(present)}"
-            )
-        return present[0] if len(present) else np.nan
-
-    # patient-level values are shared by a subject's skin AND gut rows
-    patient_stage = stage.groupby(subjects).transform(one_patient_value)
+    # A patient's MF stage may differ over time and across lesions, and the per-sample stage of the
+    # sequencing metadata is the authority: keep each sample's own stage (never averaged or de-duplicated
+    # to one per patient). Blank stages stay missing (standardize_metadata fills healthy/unspecified).
+    patient_stage = stage
 
     global_score = pd.to_numeric(rows["global_severity"].astype(object).map(
         lambda v: np.nan if pd.isna(v) else str(v).strip().replace(",", ".")), errors="coerce")

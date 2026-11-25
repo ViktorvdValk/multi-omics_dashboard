@@ -1,0 +1,27 @@
+[project]
+name = "multiomics-dashboard"
+version = "0.1.0"
+description = "Data loaders and dashboard for the combined skin/gut microbiome, energy metabolism and ceramide studies"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # tables: CSV/TSV metadata, ceramides, energy metabolism, Emu output
+    "pandas>=2.2",
+    "numpy>=1.26",
+    # Excel: Biotaviz microbiome exports
+    "openpyxl>=3.1",
+    # statistics and ordination
+    "scipy>=1.13",
+    "scikit-bio>=0.6",
+    # dashboard
+    "streamlit>=1.40",
+    "plotly>=5.24",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+# The project is an application, not an installable package
+package = false

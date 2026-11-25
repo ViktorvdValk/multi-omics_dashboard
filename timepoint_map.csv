@@ -1,25 +1,19 @@
 dataset,study,label in file,samples,timepoint
-Skin microbiome,1806,post,24,follow-up
-Skin microbiome,1806,pre,63,baseline
-Gut microbiome,1806,post,24,follow-up
-Gut microbiome,1806,pre,35,baseline
-Ceramides,1806,0,72,baseline
-Ceramides,1806,28,52,mid
-Ceramides,1806,112,52,follow-up
-Ceramides,1806,-14,74,screening
+Skin microbiome,1806,d1,63,baseline
+Skin microbiome,1806,d112,24,follow-up
+Gut microbiome,1806,d1,35,baseline
+Gut microbiome,1806,d112,24,follow-up
 Energy metabolism,1806,0,77,baseline
 Energy metabolism,1806,28,72,mid
 Energy metabolism,1806,111,48,follow-up
 Energy metabolism,1806,112,25,follow-up
 Energy metabolism,1806,nvt,10,baseline
-Skin microbiome,1947,mid,78,mid
-Skin microbiome,1947,post,47,follow-up
-Skin microbiome,1947,pre,52,baseline
-Gut microbiome,1947,post,20,follow-up
-Gut microbiome,1947,pre,22,baseline
-Ceramides,1947,2,42,baseline
-Ceramides,1947,61,21,mid
-Ceramides,1947,62,12,mid
-Ceramides,1947,99,52,follow-up
-Skin microbiome,2230,pre,253,baseline
-Ceramides,2230,1,76,baseline
+Metadata file,1806,(none),232,baseline
+Skin microbiome,1947,visit1,52,baseline
+Skin microbiome,1947,visit2,39,mid
+Skin microbiome,1947,visit2.1,39,mid
+Skin microbiome,1947,visit99,47,follow-up
+Gut microbiome,1947,d1,22,baseline
+Gut microbiome,1947,d83,20,mid
+Skin microbiome,2230,visit1,143,baseline
+Skin microbiome,2230,visit2,91,follow-up
